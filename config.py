@@ -5,7 +5,8 @@ from typing import Optional
 
 @dataclass
 class Settings:
-    device_name: str = "BERRY-MED"
+    device_name: str = "BerryMed"
+    device_address: str = "00:A0:50:58:72:DB"
     scan_timeout: int = 10
     connect_timeout: int = 20
 
@@ -32,6 +33,36 @@ class Settings:
     log_level: int = logging.INFO
     log_format: str = "%(asctime)s | %(name)-18s | %(levelname)-6s | %(message)s"
     output_file: Optional[str] = None
+
+    # ---------------------------------------------------------------------------
+    # Customized Real-Time IIR Filters Settings
+    # ---------------------------------------------------------------------------
+    # Filter 1: Real-time Butterworth Bandpass (Default: 0.5Hz - 8Hz, 2nd-order)
+    filter1_lowcut: float = 0.5
+    filter1_highcut: float = 8.0
+    filter1_order: int = 2
+
+    # Filter 2: Real-time Butterworth Bandpass (Default: 0.5Hz - 40Hz, 4th-order)
+    filter2_lowcut: float = 0.5
+    filter2_highcut: float = 40.0
+    filter2_order: int = 4
+
+    # ---------------------------------------------------------------------------
+    # 30-Second Block-Processing Settings (Zero-Phase / FIR Filter)
+    # ---------------------------------------------------------------------------
+    block_duration_sec: float = 30.0
+    block_filter_lowcut: float = 0.5
+    block_filter_highcut: float = 40.0
+    block_filter_type: str = "fir"  # options: 'fir', 'butter_filtfilt'
+    block_fir_numtaps: int = 101
+
+    # ---------------------------------------------------------------------------
+    # Stream-specific CSV Filenames
+    # ---------------------------------------------------------------------------
+    save_csv_raw: str = "pleth_data_raw.csv"
+    save_csv_filter1: str = "pleth_data_butter_0.5_8hz.csv"
+    save_csv_filter2: str = "pleth_data_butter_0.5_40hz.csv"
+    save_csv_block: str = "pleth_data_block_fir_0.5_40hz.csv"
 
 
 SETTINGS = Settings()

@@ -42,14 +42,25 @@ class BLEManager:
         self._data_callback = callback
 
     async def scan(self, timeout: Optional[int] = None) -> BLEDevice:
-        logger.info("Scanning for device '%s' ...", SETTINGS.device_name)
-        device = await BleakScanner.find_device_by_name(
-            SETTINGS.device_name, timeout=timeout or SETTINGS.scan_timeout
-        )
-        if device is None:
-            raise DiscoveryTimeout(
-                f"Device '{SETTINGS.device_name}' not found within {timeout or SETTINGS.scan_timeout}s"
+        addr = SETTINGS.device_address.strip().upper()
+        if addr:
+            logger.info("Scanning for address '%s' ...", addr)
+            device = await BleakScanner.find_device_by_address(
+                addr, timeout=timeout or SETTINGS.scan_timeout
             )
+            if device is None:
+                raise DiscoveryTimeout(
+                    f"Device at '{addr}' not found within {timeout or SETTINGS.scan_timeout}s"
+                )
+        else:
+            logger.info("Scanning for device '%s' ...", SETTINGS.device_name)
+            device = await BleakScanner.find_device_by_name(
+                SETTINGS.device_name, timeout=timeout or SETTINGS.scan_timeout
+            )
+            if device is None:
+                raise DiscoveryTimeout(
+                    f"Device '{SETTINGS.device_name}' not found within {timeout or SETTINGS.scan_timeout}s"
+                )
         self._device = device
         logger.info("Found device: %s [%s]", device.name, device.address)
         return device
@@ -61,15 +72,45 @@ class BLEManager:
             logger.warning("Already connected")
             return
 
-        logger.info("Connecting to %s ...", self._device.address)
-        self._client = BleakClient(self._device, timeout=timeout or SETTINGS.connect_timeout)
-        try:
-            await self._client.connect()
-            self._connected = True
-            logger.info("Connected to %s", self._device.address)
-        except BleakError as exc:
-            self._connected = False
-            raise ConnectionFailed(str(exc)) from exc
+        addr = self._device.address
+        timeout = timeout or SETTINGS.connect_timeout
+
+        # Try both address types — Windows sometimes requires "random"
+        for addr_type in (None, "public", "random"):
+            if addr_type is None and self._already_tried("public", "random"):
+                continue
+            logger.info(
+                "Connecting to %s (addr_type=%s) ...", addr, addr_type or "auto"
+            )
+            try:
+                if addr_type:
+                    self._client = BleakClient(
+                        addr, timeout=timeout, address_type=addr_type
+                    )
+                else:
+                    self._client = BleakClient(self._device, timeout=timeout)
+                await self._client.connect()
+                self._connected = True
+                logger.info("Connected to %s", addr)
+                
+                # Log discovered services & characteristics for diagnostics
+                logger.info("Discovering services and characteristics:")
+                for service in self._client.services:
+                    logger.info("Service: %s", service.uuid)
+                    for char in service.characteristics:
+                        logger.info("  -> Characteristic: %s (properties: %s)", char.uuid, char.properties)
+                
+                # Allow the connection and Windows BLE stack to fully stabilize
+                await asyncio.sleep(1.0)
+                return
+            except (BleakError, TimeoutError, asyncio.TimeoutError) as exc:
+                self._connected = False
+                self._client = None
+                logger.warning("  attempt with %s failed: %s", addr_type or "auto", exc)
+
+        raise ConnectionFailed(
+            f"Could not connect to {addr} after retries"
+        )
 
     async def disconnect(self) -> None:
         if self._client and self._client.is_connected:
@@ -93,7 +134,15 @@ class BLEManager:
         if not self.connected:
             raise RuntimeError("Not connected")
         logger.info("Sending command: %s", cmd.hex())
-        await self._client.write_gatt_char(SETTINGS.recv_char_uuid, cmd, response=True)
+        try:
+            await self._client.write_gatt_char(SETTINGS.recv_char_uuid, cmd, response=True)
+        except Exception as e:
+            logger.warning("Write with response failed, retrying without response: %s", e)
+            try:
+                await self._client.write_gatt_char(SETTINGS.recv_char_uuid, cmd, response=False)
+            except Exception as e2:
+                logger.error("All write attempts failed: %s", e2)
+                raise e2
 
     # ------------------------------------------------------------------
     # Internal
@@ -102,6 +151,9 @@ class BLEManager:
     def _handle_notification(self, _sender: int, data: bytes) -> None:
         if self._data_callback:
             self._data_callback(data)
+
+    def _already_tried(self, *types: str) -> bool:
+        return False  # simple guard — always try the explicit types too
 
     async def __aenter__(self) -> BLEManager:
         return self
