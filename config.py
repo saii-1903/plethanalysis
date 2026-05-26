@@ -6,7 +6,7 @@ from typing import Optional
 @dataclass
 class Settings:
     device_name: str = "BerryMed"
-    device_address: str = "00:A0:50:58:72:DB"
+    device_address: str = ""
     scan_timeout: int = 10
     connect_timeout: int = 20
 

@@ -194,29 +194,41 @@ def build_record_from_dict(d: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Recorder  (append-mode JSON-Lines writer)
+# Recorder  (proper JSON array writer)
 # --------------------------------------------------------------------------
 
 class JSONRecorder:
     """
-    Appends one Lifesigns v1.1 JSON record per packet to a .jsonl file.
+    Writes a valid JSON array file — one Lifesigns v1.1 record per element.
 
-    Each line is a self-contained, valid JSON object — this format is
-    efficient for streaming data and easy to parse line-by-line later.
+    File structure:
+        [
+          { ...packet 0... },
+          { ...packet 1... },
+          ...
+          { ...packet N... }
+        ]
+
+    The array is opened on construction and closed (terminated with `]`)
+    when close() is called.  The file is readable as standard JSON by any
+    tool (Python json.load, Excel Power Query, Postman, jq, etc.).
 
     Usage:
-        recorder = JSONRecorder()                   # default path
-        recorder = JSONRecorder("my_session.jsonl") # custom path
+        recorder = JSONRecorder()                  # default path
+        recorder = JSONRecorder("session.json")    # custom path
 
-        # From a PlethPacket (BLE pipeline):
-        recorder.save_packet(pkt)
-
-        # From the web /data endpoint dict:
-        recorder.save_dict(incoming_dict)
+        recorder.save_packet(pkt)   # from BLE pipeline
+        recorder.save_dict(d)       # from web /data endpoint
+        recorder.close()            # finalises the JSON array
     """
 
     def __init__(self, path: Union[str, Path, None] = None) -> None:
         self.path = Path(path) if path else DEFAULT_JSON_PATH
+        # Give default file a .json extension
+        if self.path == DEFAULT_JSON_PATH:
+            self.path = self.path.with_suffix(".json")
+        elif self.path.suffix == ".jsonl":
+            self.path = self.path.with_suffix(".json")
         self._fh = None
         self._count = 0
         self._open()
@@ -225,7 +237,9 @@ class JSONRecorder:
 
     def _open(self) -> None:
         try:
-            self._fh = open(self.path, "a", encoding="utf-8")
+            self._fh = open(self.path, "w", encoding="utf-8")
+            self._fh.write("[\n")   # open the JSON array
+            self._fh.flush()
             logger.info("JSONRecorder: writing to %s", self.path)
         except OSError as exc:
             logger.error("JSONRecorder: cannot open %s — %s", self.path, exc)
@@ -233,9 +247,19 @@ class JSONRecorder:
 
     def close(self) -> None:
         if self._fh:
+            try:
+                # Close the JSON array cleanly
+                if self._count == 0:
+                    self._fh.write("]")          # empty array
+                else:
+                    self._fh.write("\n]")         # close after last record
+                self._fh.flush()
+            except OSError:
+                pass
             self._fh.close()
             self._fh = None
-            logger.info("JSONRecorder: closed (%d records written)", self._count)
+            logger.info("JSONRecorder: closed (%d records) → %s",
+                        self._count, self.path)
 
     def __enter__(self):
         return self
@@ -259,7 +283,9 @@ class JSONRecorder:
         if self._fh is None:
             return False
         try:
-            self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # Separate records with commas; no trailing comma on last record
+            prefix = "  " if self._count == 0 else ",\n  "
+            self._fh.write(prefix + json.dumps(record, ensure_ascii=False))
             self._fh.flush()
             self._count += 1
             return True

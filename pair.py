@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 DataCallback = Callable[[bytes], None]
 
+# Lifesigns Protocol v1.1 — comm service UUID (used for advertisement detection)
+LIFESIGNS_SERVICE_UUID = "49535343-fe7d-4ae5-8fa9-9fafd205e455"
+
 
 class DiscoveryTimeout(Exception):
     pass
@@ -47,36 +50,96 @@ class BLEManager:
 
     async def scan(self, timeout: Optional[int] = None) -> BLEDevice:
         """
-        Find the target device by MAC address (from SETTINGS).
-        Raises DiscoveryTimeout if not found within the timeout.
-        """
-        addr = SETTINGS.device_address.strip().upper()
-        t = timeout or SETTINGS.scan_timeout
-        logger.info("Scanning for device %s (timeout=%ds) …", addr, t)
+        Discover the BerryMed/Lifesigns device using THREE methods in order:
 
-        device = await BleakScanner.find_device_by_address(addr, timeout=t)
+        1. By MAC address (SETTINGS.device_address) — fastest when known
+        2. By Lifesigns service UUID (49535343-FE7D-...) — protocol-correct,
+           works even when the device advertises without a name
+        3. By device name containing "BerryMed" or "Lifesigns"
+
+        The watch MUST be worn (skin contact) to advertise.
+        Raises DiscoveryTimeout if nothing is found within the timeout.
+        """
+        t = timeout or SETTINGS.scan_timeout
+        addr = SETTINGS.device_address.strip().upper()
+
+        logger.info("[SCAN] Starting %.0fs scan (addr=%s) …", t, addr or "any")
+
+        # Run a single discover pass — check all three criteria in one sweep
+        results = await BleakScanner.discover(timeout=t, return_adv=True)
+
+        device = self._pick_device(results, addr)
+
         if device is None:
             raise DiscoveryTimeout(
-                f"Device {addr!r} not seen within {t}s"
+                f"No BerryMed/Lifesigns device found in {t}s — "
+                "make sure the watch is ON and worn on the wrist/finger."
             )
 
         self._device = device
-        logger.info("Found: %s [%s]", device.name, device.address)
+        # Update SETTINGS so the address is remembered for reconnects
+        SETTINGS.device_address = device.address
+        logger.info("[SCAN] Found: %s [%s]", device.name or "(unnamed)", device.address)
         return device
 
+    def _pick_device(self, results: dict, target_addr: str) -> Optional[BLEDevice]:
+        """
+        Lifesigns Protocol v1.1 — device identification priority:
+          1. Exact address match  (fastest when known)
+          2. Lifesigns Comm Service UUID 49535343-FE7D-...  (protocol-correct)
+          3. BerryMed OUI prefix  00:A0:50 / AC:67:B2  (reliable hardware ID)
+          4. Name keyword  berrymed / lifesigns / niso
+        """
+        # Known BerryMed MAC OUI prefixes (first 3 bytes = 8 chars with colons)
+        BERRY_OUI = {"00:A0:50", "AC:67:B2", "A4:C1:38"}
+
+        by_svc  = []
+        by_oui  = []
+        by_name = []
+
+        for addr, (dev, adv) in results.items():
+            addr_up = addr.upper()
+
+            # Priority 1 — exact address
+            if target_addr and addr_up == target_addr:
+                logger.info("[SCAN] Matched by address: %s", addr_up)
+                return dev
+
+            # Priority 2 — Lifesigns Comm Service UUID (v1.1 spec)
+            svc_uuids = [s.lower() for s in (adv.service_uuids or [])]
+            if LIFESIGNS_SERVICE_UUID in svc_uuids:
+                logger.info("[SCAN] Matched by service UUID: %s [%s]",
+                            dev.name or "(unnamed)", addr_up)
+                by_svc.append(dev)
+                continue          # best non-address match, skip lower priorities
+
+            # Priority 3 — BerryMed OUI prefix
+            if addr_up[:8] in BERRY_OUI:
+                logger.info("[SCAN] Matched by OUI prefix: %s [%s]",
+                            dev.name or "(unnamed)", addr_up)
+                by_oui.append(dev)
+                continue
+
+            # Priority 4 — name hint (fallback)
+            name = (dev.name or "").lower()
+            if "berrymed" in name or "lifesigns" in name or "niso" in name:
+                logger.info("[SCAN] Matched by name: %s [%s]", dev.name, addr_up)
+                by_name.append(dev)
+
+        for bucket in (by_svc, by_oui, by_name):
+            if bucket:
+                return bucket[0]
+        return None
+
     async def connect(self, timeout: Optional[int] = None) -> None:
-        """
-        Connect to the previously scanned device.
-        Works with bleak 0.x and 1.x — no address_type kwarg.
-        """
+        """Connect to the previously scanned device (bleak 1.x compatible)."""
         if self._device is None:
             raise RuntimeError("Call scan() before connect()")
 
-        # Tear down any stale client before trying again
         await self._safe_disconnect()
 
         t = timeout or SETTINGS.connect_timeout
-        logger.info("Connecting to %s (timeout=%ds) …", self._device.address, t)
+        logger.info("[BLE] Connecting to %s …", self._device.address)
 
         try:
             self._client = BleakClient(self._device, timeout=t)
@@ -84,13 +147,13 @@ class BLEManager:
         except (BleakError, TimeoutError, asyncio.TimeoutError, OSError) as exc:
             self._client = None
             raise ConnectionFailed(
-                f"Could not connect to {self._device.address}: {exc}"
+                f"Connect failed for {self._device.address}: {exc}"
             ) from exc
 
         self._connected = True
-        logger.info("Connected to %s", self._device.address)
+        logger.info("[BLE] Connected to %s", self._device.address)
 
-        # Log services for diagnostics
+        # Log services at DEBUG level
         for svc in self._client.services:
             logger.debug("  Service %s", svc.uuid)
             for ch in svc.characteristics:
@@ -101,16 +164,16 @@ class BLEManager:
 
     async def disconnect(self) -> None:
         await self._safe_disconnect()
-        logger.info("Disconnected")
+        logger.info("[BLE] Disconnected")
 
     async def start_stream(self) -> None:
         if not self.connected:
             raise RuntimeError("Not connected — call connect() first")
-        logger.info("Subscribing to %s", SETTINGS.send_char_uuid)
+        logger.info("[BLE] Subscribing to %s", SETTINGS.send_char_uuid)
         await self._client.start_notify(
             SETTINGS.send_char_uuid, self._handle_notification
         )
-        logger.info("Stream started — listening for data")
+        logger.info("[BLE] Stream started")
 
     async def stop_stream(self) -> None:
         if self._client and self._client.is_connected:
@@ -118,30 +181,28 @@ class BLEManager:
                 await self._client.stop_notify(SETTINGS.send_char_uuid)
             except Exception:
                 pass
-        logger.info("Stream stopped")
+        logger.info("[BLE] Stream stopped")
 
     async def send_command(self, cmd: bytes) -> None:
         if not self.connected:
             raise RuntimeError("Not connected")
-        logger.info("Sending command: 0x%s", cmd.hex().upper())
+        logger.info("[BLE] Sending command 0x%s", cmd.hex().upper())
         try:
             await self._client.write_gatt_char(
                 SETTINGS.recv_char_uuid, cmd, response=True
             )
-            logger.info("Command sent (with-response)")
         except Exception as e1:
-            logger.warning("write with-response failed (%s) — retrying without", e1)
+            logger.warning("[BLE] write(response=True) failed: %s — retrying", e1)
             try:
                 await self._client.write_gatt_char(
                     SETTINGS.recv_char_uuid, cmd, response=False
                 )
-                logger.info("Command sent (without-response)")
             except Exception as e2:
-                logger.error("Command write failed entirely: %s", e2)
+                logger.error("[BLE] Command write failed: %s", e2)
                 raise
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal
     # ------------------------------------------------------------------
 
     def _handle_notification(self, _sender: int, data: bytes) -> None:
@@ -149,7 +210,6 @@ class BLEManager:
             self._data_callback(data)
 
     async def _safe_disconnect(self) -> None:
-        """Silently tear down any existing client."""
         if self._client:
             try:
                 if self._client.is_connected:

@@ -41,7 +41,19 @@ logger = logging.getLogger("server")
 # JSON recorder — Lifesigns v1.1 format (one record per packet, JSONL file)
 # ---------------------------------------------------------------------------
 
-_json_recorder: JSONRecorder = JSONRecorder()
+# Recorder is None until the first connection — a fresh file is opened each
+# time the watch connects and closed when it disconnects / runner stops.
+_json_recorder: Optional[JSONRecorder] = None
+
+
+def _open_session_recorder(device_name: str = "BerryMed") -> JSONRecorder:
+    """Create a new JSONL file named by session start time."""
+    from pathlib import Path
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = device_name.replace(" ", "_").replace(":", "")[:20]
+    path = Path(__file__).parent / f"lifesigns_{safe}_{ts}.json"
+    logger.info("[REC] New session file: %s", path)
+    return JSONRecorder(path)
 
 # ---------------------------------------------------------------------------
 # BLE pipeline — manager, parser, processor (all singletons)
@@ -130,9 +142,10 @@ def _on_ble_data(data: bytes) -> None:
     proc = _ble_processor.process(pkt.adc_samples)
 
     # ── Save to Lifesigns v1.1 JSON-Lines (includes accelerometer x/y/z) ──
-    saved = _json_recorder.save_packet(pkt)
-    if saved:
-        _ble_status["packets_saved"] += 1
+    if _json_recorder is not None:
+        saved = _json_recorder.save_packet(pkt)
+        if saved:
+            _ble_status["packets_saved"] += 1
 
     # ── Broadcast to all connected browser clients ─────────────────────────
     broadcast({
@@ -169,9 +182,10 @@ async def _ble_runner() -> None:
       1. Keeps scanning until the BerryMed watch is seen (no give-up limit)
       2. Connects immediately when found and requests original-waveform mode
       3. Streams packets → _on_ble_data
-      4. On disconnect, goes back to scanning automatically
+      4. On disconnect, closes the session file and goes back to scanning
     Cancelled only by /ble/disconnect or server shutdown.
     """
+    global _json_recorder
     while True:
         try:
             # ── SCAN until the watch appears ──────────────────────────────
@@ -211,21 +225,44 @@ async def _ble_runner() -> None:
             cmd = _data_parser.send_command(SETTINGS.cmd_original_wave)
             await _ble_manager.send_command(cmd)
 
+            # Tell the watch to stay awake for at least 1 minute (0xF7).
+            # Without this, the BerryMed stops advertising ~30 s after it
+            # loses skin contact, making reconnects impossible.
+            wake_cmd = _data_parser.send_command(SETTINGS.cmd_wake_1min)
+            await _ble_manager.send_command(wake_cmd)
+            logger.info("[BLE] Wake-keep (0xF7) sent — watch will stay awake 1 min")
+
             _ble_manager.on_data(_on_ble_data)
             await _ble_manager.start_stream()
 
+            # ── Open a fresh JSONL file for this session ───────────────────
+            if _json_recorder is not None:
+                _json_recorder.close()
+            _json_recorder = _open_session_recorder(dev_name)
+
             _ble_status.update({
-                "state":       "connected",
-                "address":     _ble_target_address,
-                "device_name": dev_name,
+                "state":            "connected",
+                "address":          _ble_target_address,
+                "device_name":      dev_name,
+                "packets_received": 0,
+                "packets_saved":    0,
+                "session_file":     str(_json_recorder.path),
             })
             broadcast_ble_state("connected",
-                                device_name=dev_name, address=_ble_target_address)
-            logger.info("[BLE] Connected — streaming data")
+                                device_name=dev_name, address=_ble_target_address,
+                                session_file=str(_json_recorder.path))
+            logger.info("[BLE] Connected — streaming data → %s", _json_recorder.path)
 
             # ── STREAM — keep alive until watch drops ─────────────────────
             while _ble_manager.connected:
                 await asyncio.sleep(0.5)
+
+            # ── Session ended — close this file ───────────────────────────
+            if _json_recorder is not None:
+                logger.info("[REC] Session ended — %d records saved to %s",
+                            _json_recorder.records_written, _json_recorder.path)
+                _json_recorder.close()
+                _json_recorder = None
 
             logger.warning("[BLE] Watch disconnected — going back to scan")
             _ble_status["state"] = "scanning"
@@ -242,6 +279,11 @@ async def _ble_runner() -> None:
 
         except asyncio.CancelledError:
             logger.info("[BLE] Runner cancelled")
+            if _json_recorder is not None:
+                logger.info("[REC] Runner cancelled — closing session file (%d records)",
+                            _json_recorder.records_written)
+                _json_recorder.close()
+                _json_recorder = None
             break
 
         except Exception as exc:
@@ -279,7 +321,8 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     await _ble_manager.disconnect()
-    _json_recorder.close()
+    if _json_recorder is not None:
+        _json_recorder.close()
     logger.info("Web server stopped")
 
 
@@ -395,47 +438,7 @@ html, body { width: 100%; height: 100%; overflow: hidden;
 #controls button:hover  { background: #1c1c24; color: #f0f0f5; border-color: #48485a; }
 #controls button.active { background: rgba(0, 255, 102, 0.1); color: #00ff66; border-color: #00ff66; }
 
-/* ── Device picker modal ────────────────────────────────────────────────── */
-#modal-overlay {
-  display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.72);
-  z-index: 100; align-items: center; justify-content: center; }
-#modal-overlay.open { display: flex; }
-#modal-box {
-  background: #0d0d12; border: 1px solid #2a2a35; border-radius: 14px;
-  padding: 24px 28px; min-width: 420px; max-width: 560px; width: 90%;
-  box-shadow: 0 24px 60px rgba(0,0,0,0.7); }
-#modal-title { font-size: 14px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 1.2px; color: #f0f0f5; margin-bottom: 6px; }
-#modal-sub   { font-size: 12px; color: #7a7a85; margin-bottom: 18px; }
-#modal-scan-btn {
-  width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #00d2ff;
-  background: rgba(0,210,255,0.08); color: #00d2ff; font-size: 12px;
-  font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
-  cursor: pointer; font-family: inherit; transition: all 0.2s;
-  margin-bottom: 14px; }
-#modal-scan-btn:hover:not(:disabled) { background: rgba(0,210,255,0.18); }
-#modal-scan-btn:disabled { opacity: 0.5; cursor: default; }
-#device-list { max-height: 280px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
-.dev-row {
-  display: flex; align-items: center; gap: 12px; padding: 10px 14px;
-  border-radius: 8px; border: 1px solid #1e1e28; cursor: pointer;
-  transition: all 0.18s; background: rgba(255,255,255,0.02); }
-.dev-row:hover { background: rgba(255,255,255,0.06); border-color: #3a3a48; }
-.dev-row.berry { border-color: rgba(0,210,255,0.3); background: rgba(0,210,255,0.05); }
-.dev-row.berry:hover { background: rgba(0,210,255,0.12); border-color: #00d2ff; }
-.dev-icon { font-size: 18px; flex-shrink: 0; }
-.dev-info { flex: 1; min-width: 0; }
-.dev-name { font-size: 13px; font-weight: 600; color: #f0f0f5;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dev-addr { font-size: 11px; color: #7a7a85; font-variant-numeric: tabular-nums; margin-top: 2px; }
-.dev-badge { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px;
-  background: rgba(0,210,255,0.15); color: #00d2ff; flex-shrink: 0; }
-#modal-status { font-size: 12px; color: #7a7a85; text-align: center; margin-top: 12px; min-height: 18px; }
-#modal-close-btn {
-  margin-top: 16px; width: 100%; padding: 8px; border-radius: 8px;
-  border: 1px solid #2a2a35; background: transparent; color: #7a7a85;
-  font-size: 12px; cursor: pointer; font-family: inherit; transition: all 0.2s; }
-#modal-close-btn:hover { background: rgba(255,255,255,0.04); color: #f0f0f5; }
+/* (device-picker modal removed — Connect Watch auto-discovers any Lifesigns device) */
 </style>
 </head>
 <body>
@@ -477,16 +480,7 @@ html, body { width: 100%; height: 100%; overflow: hidden;
     </div>
   </div>
 
-  <!-- Device picker modal -->
-  <div id="modal-overlay" onclick="if(event.target===this)closeModal()">
-    <div id="modal-box">
-      <div id="modal-title">Select BerryMed Device</div>
-      <div id="modal-sub">Scan for nearby BLE devices and tap one to connect.</div>
-      <button id="modal-scan-btn" onclick="modalScan()">&#x1F50D; Scan for Devices</button>
-      <div id="device-list"><div id="modal-status">Press scan to search for devices.</div></div>
-      <button id="modal-close-btn" onclick="closeModal()">Cancel</button>
-    </div>
-  </div>
+  <!-- No device-picker modal needed — Connect Watch button auto-discovers any Lifesigns device -->
 
   <div id="plot-wrap">
     <!-- TAB 1: LIVE SWEEP MONITOR -->
@@ -645,15 +639,18 @@ let _blePackets = 0;
 let _bleDevName = '';
 
 function showBleError(msg) {
+  // Persist until the next successful state change clears it
   const el = document.getElementById('status-text');
-  if (el) { el.textContent = '⚠ ' + msg; el.style.color='#ff453a'; }
-  setTimeout(() => { if(el){el.style.color='';} }, 5000);
+  if (el) { el.textContent = '⚠ ' + msg; el.style.color = '#ff453a'; }
+  // Also show in the BLE counter area so it's visible alongside the button
+  const pktsEl = document.getElementById('ble-pkts');
+  if (pktsEl) { pktsEl.textContent = 'Error'; pktsEl.style.color = '#ff453a'; }
 }
 
 const BLE_UI = {
   idle:        { label: 'Connect Watch',  cls: '',               disabled: false },
-  scanning:    { label: 'Scanning…', cls: 'state-busy',     disabled: true  },
-  connecting:  { label: 'Connecting…',cls:'state-busy',     disabled: true  },
+  scanning:    { label: '⏹ Cancel Scan', cls: 'state-busy',     disabled: false },
+  connecting:  { label: '⏹ Cancel',      cls: 'state-busy',     disabled: false },
   connected:   { label: 'Disconnect',     cls: 'state-connected',disabled: false },
   disconnected:{ label: 'Connect Watch',  cls: '',               disabled: false },
   error:       { label: 'Retry Connect',  cls: 'state-error',    disabled: false },
@@ -668,96 +665,58 @@ function applyBleUI(state, pkts, devName) {
   btn.id = 'btn-ble';
   btn.disabled = cfg.disabled;
   document.getElementById('ble-label').textContent = cfg.label;
+
+  // Clear any error colouring on transitions to non-error states
+  if (state !== 'error') {
+    const stEl = document.getElementById('status-text');
+    if (stEl && stEl.style.color === 'rgb(255, 69, 58)') {
+      stEl.style.color = '';
+    }
+    const pktsEl2 = document.getElementById('ble-pkts');
+    if (pktsEl2 && pktsEl2.style.color) pktsEl2.style.color = '';
+  }
+
   const pktsEl = document.getElementById('ble-pkts');
   if (state === 'connected' && pkts != null) {
     pktsEl.textContent = (devName ? devName + ' · ' : '') + pkts + ' pkts';
-  } else {
-    pktsEl.textContent = '';
+  } else if (state !== 'error') {
+    pktsEl.textContent = state === 'scanning' ? 'Scanning…' :
+                         state === 'connecting' ? 'Connecting…' : '';
   }
 }
 
-// Called when the main button is clicked
+// ── BLE button — one click connects, one click cancels/disconnects ───────────
 window.bleButtonClick = async function() {
   if (_bleState === 'connected') {
-    // Disconnect immediately
     await fetch('/ble/disconnect', { method: 'POST' });
     applyBleUI('idle', 0);
-  } else if (_bleState === 'scanning' || _bleState === 'connecting') {
-    // do nothing while busy
-  } else {
-    // Open device picker modal
-    openModal();
+    return;
   }
-};
-
-// ── Device picker modal ───────────────────────────────────────────────────────
-function openModal() {
-  document.getElementById('modal-overlay').classList.add('open');
-}
-window.closeModal = function() {
-  document.getElementById('modal-overlay').classList.remove('open');
-};
-
-window.modalScan = async function() {
-  const scanBtn  = document.getElementById('modal-scan-btn');
-  const listEl   = document.getElementById('device-list');
-  const statusEl = document.getElementById('modal-status');
-
-  scanBtn.disabled = true;
-  scanBtn.textContent = '⏳ Scanning (8s)…';
-  listEl.innerHTML = '';
-  statusEl.textContent = 'Scanning for nearby BLE devices…';
-
+  if (_bleState === 'scanning' || _bleState === 'connecting') {
+    // User wants to cancel — stop and go back to idle
+    await fetch('/ble/disconnect', { method: 'POST' });
+    applyBleUI('idle', 0);
+    return;
+  }
+  // idle / error / stopped → start auto-scan (no address = find any Lifesigns device)
+  applyBleUI('scanning', 0);
   try {
-    const r = await fetch('/ble/scan?timeout=8');
-    const data = await r.json();
-
-    listEl.innerHTML = '';
-    if (!data.ok) {
-      statusEl.textContent = 'Scan error: ' + (data.error || 'unknown');
-    } else if (data.devices.length === 0) {
-      statusEl.textContent = 'No devices found. Make sure the watch is powered on.';
-    } else {
-      statusEl.textContent = data.devices.length + ' device(s) found. Tap one to connect.';
-      data.devices.forEach(dev => {
-        const row = document.createElement('div');
-        row.className = 'dev-row' + (dev.is_berrymed ? ' berry' : '');
-        row.innerHTML =
-          '<span class="dev-icon">' + (dev.is_berrymed ? '💚' : '📶') + '</span>' +
-          '<div class="dev-info">' +
-            '<div class="dev-name">' + escHtml(dev.name) + '</div>' +
-            '<div class="dev-addr">' + escHtml(dev.address) + '</div>' +
-          '</div>' +
-          (dev.is_berrymed ? '<span class="dev-badge">BerryMed</span>' : '');
-        row.addEventListener('click', () => connectToDevice(dev.address, dev.name));
-        listEl.appendChild(row);
-      });
+    const r = await fetch('/ble/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),   // empty = auto-discover any BerryMed/Lifesigns watch
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      showBleError(d.reason || 'Could not start BLE runner');
+      applyBleUI('error', 0);
     }
+    // State changes come in via WebSocket (_ble_event) from here on
   } catch(e) {
-    statusEl.textContent = 'Scan failed: ' + e;
-  } finally {
-    scanBtn.disabled = false;
-    scanBtn.textContent = '🔍 Scan Again';
+    showBleError('Network error: ' + e);
+    applyBleUI('error', 0);
   }
 };
-
-async function connectToDevice(address, name) {
-  document.getElementById('modal-status').textContent =
-    'Connecting to ' + name + '…';
-  document.getElementById('modal-scan-btn').disabled = true;
-
-  // Disable all device rows while connecting
-  document.querySelectorAll('.dev-row').forEach(r => r.style.pointerEvents = 'none');
-
-  const r = await fetch('/ble/connect', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ address: address }),
-  });
-  const d = await r.json();
-  applyBleUI(d.status ? d.status.state : 'scanning', 0, name);
-  closeModal();
-}
 
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -1044,9 +1003,11 @@ class IncomingPacket(BaseModel):
 @app.post("/data")
 async def receive_data(pkt: IncomingPacket):
     d = pkt.model_dump()
-    _json_recorder.save_dict(d)
+    if _json_recorder is not None:
+        _json_recorder.save_dict(d)
     broadcast(d)
-    return {"ok": True, "relayed": len(browser_clients), "saved": _json_recorder.records_written}
+    saved = _json_recorder.records_written if _json_recorder else 0
+    return {"ok": True, "relayed": len(browser_clients), "saved": saved}
 
 
 # ---------------------------------------------------------------------------
@@ -1063,10 +1024,28 @@ async def ble_connect(req: BLEConnectRequest = BLEConnectRequest()):
     Start scanning for a BerryMed watch and begin streaming.
     Pass {"address": "XX:XX:XX:XX:XX:XX"} to connect to a specific device
     found via /ble/scan; omit to use the address in config.py.
+
+    If a runner is already CONNECTED, refuses (disconnect first).
+    If a runner is scanning/connecting/error, cancels it and restarts with
+    the new target — this is the normal path after a modal scan pick.
     """
     global _ble_task, _ble_target_address
+
     if _ble_task and not _ble_task.done():
-        return {"ok": False, "reason": "BLE runner already active", "status": _ble_status}
+        if _ble_status.get("state") == "connected":
+            # Already streaming — don't interrupt
+            return {"ok": False, "reason": "Already connected — disconnect first", "status": _ble_status}
+
+        # Runner is scanning/connecting/error for old target — cancel it so we
+        # can restart cleanly with the device the user just picked from the modal.
+        logger.info("[BLE] Cancelling runner (state=%s) to honour new connect request",
+                    _ble_status.get("state"))
+        _ble_task.cancel()
+        try:
+            await _ble_task
+        except asyncio.CancelledError:
+            pass
+        _ble_task = None
 
     _ble_target_address = (req.address or SETTINGS.device_address).strip().upper()
     _data_parser.flush()
@@ -1106,31 +1085,52 @@ async def ble_scan(timeout: float = 8.0):
     timeout = max(3.0, min(timeout, 20.0))
     logger.info("[BLE] Ad-hoc scan %.0fs …", timeout)
 
+    # Lifesigns Protocol v1.1 — Comm Service UUID used to identify BerryMed devices
+    # even when they advertise without a readable name (common on BerryMed hardware)
+    LIFESIGNS_SVC_UUID = "49535343-fe7d-4ae5-8fa9-9fafd205e455"
+    BERRY_KEYWORDS = {"berrymed", "berry", "lifesigns", "niso", "o2m", "spo2"}
+
     try:
-        raw_devices = await BleakScanner.discover(timeout=timeout, return_adv=False)
+        # return_adv=True gives us (BLEDevice, AdvertisementData) so we can
+        # check service UUIDs broadcast in the advertisement — the v1.1 protocol
+        # way to identify the device even if name is blank.
+        scan_results = await BleakScanner.discover(timeout=timeout, return_adv=True)
     except Exception as exc:
         logger.error("[BLE] Scan error: %s", exc)
         return {"ok": False, "error": str(exc), "devices": []}
 
-    BERRY_KEYWORDS = {"berrymed", "berry", "lifesigns", "niso", "o2m", "spo2"}
-
-    # Cache every discovered device by address so _ble_runner can skip re-scan
+    # Cache every discovered BLEDevice by address so _ble_runner can skip re-scan.
+    # Use dev.address (not the dict key) so the key format exactly matches what
+    # we send to the browser and what comes back in /ble/connect.
     _scan_device_cache = {
-        d.address.upper(): d for d in raw_devices
+        dev.address.upper(): dev for _addr, (dev, _adv) in scan_results.items()
     }
 
+    # BerryMed OUI prefixes — all known BerryMed watch MAC ranges
+    BERRY_OUI = {"00:A0:50", "AC:67:B2", "A4:C1:38"}
+
     devices = []
-    for d in raw_devices:
-        name = d.name or ""
-        is_berry = any(kw in name.lower() for kw in BERRY_KEYWORDS)
+    for addr, (dev, adv) in scan_results.items():
+        name = dev.name or ""
+        # Priority 1 — Lifesigns service UUID (protocol-correct, works even if name is blank)
+        svc_uuids = [s.lower() for s in (adv.service_uuids or [])]
+        by_uuid = LIFESIGNS_SVC_UUID in svc_uuids
+        # Priority 2 — known BerryMed OUI prefix in MAC address
+        by_oui  = dev.address.upper()[:8] in BERRY_OUI
+        # Priority 3 — device name keyword
+        by_name = any(kw in name.lower() for kw in BERRY_KEYWORDS)
+        is_berry = by_uuid or by_oui or by_name
+        if is_berry:
+            how = ("uuid" if by_uuid else "") + (" oui" if by_oui else "") + (" name" if by_name else "")
+            logger.info("[BLE] BerryMed match [%s]: %s [%s]", how.strip(), name or "(unnamed)", dev.address)
         devices.append({
-            "address":    d.address,
-            "name":       name or "(unnamed)",
+            "address":    dev.address,
+            "name":       name or f"BerryMed {dev.address[-5:]}" if is_berry else "(unnamed)",
             "is_berrymed": is_berry,
         })
 
     devices.sort(key=lambda x: (not x["is_berrymed"], x["name"].lower()))
-    logger.info("[BLE] Scan complete — %d devices, %d BerryMed",
+    logger.info("[BLE] Scan complete — %d devices, %d BerryMed/Lifesigns",
                 len(devices), sum(1 for d in devices if d["is_berrymed"]))
 
     return {
@@ -1162,9 +1162,33 @@ async def ble_status_endpoint():
     """Return current BLE connection state and packet counters."""
     return {
         **_ble_status,
+        "target_address":  _ble_target_address,
+        "scan_cache_keys": list(_scan_device_cache.keys()),
         "parser_stats":    _data_parser.stats,
         "json_records":    _json_recorder.records_written,
         "browser_clients": len(browser_clients),
+    }
+
+
+@app.get("/ble/debug")
+async def ble_debug():
+    """
+    One-shot diagnostic endpoint — run while the issue is happening.
+    Open http://localhost:8000/ble/debug in the browser and paste the
+    JSON into the issue report.
+    """
+    import platform, sys
+    return {
+        "ble_status":       {**_ble_status},
+        "target_address":   _ble_target_address,
+        "scan_cache_keys":  list(_scan_device_cache.keys()),
+        "runner_alive":     bool(_ble_task and not _ble_task.done()),
+        "manager_connected": _ble_manager.connected,
+        "manager_device":   str(getattr(_ble_manager, "_device", None)),
+        "parser_stats":     _data_parser.stats,
+        "json_records":     _json_recorder.records_written,
+        "python":           sys.version,
+        "platform":         platform.platform(),
     }
 
 
@@ -1209,7 +1233,8 @@ async def _run_simulator():
             "raw_block":         proc["raw_block"],
             "filt_block":        proc["filt_block"],
         }
-        _json_recorder.save_dict(pkt_dict)
+        if _json_recorder is not None:
+            _json_recorder.save_dict(pkt_dict)
         broadcast(pkt_dict)
 
 
