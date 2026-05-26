@@ -1,1 +1,7 @@
 __pycache__
+pleth_data_raw.csv
+pleth_data_butter_0.5_8hz.csv
+pleth_data_butter_0.5_40hz.csv
+pleth_data_block_fir_0.5_40hz.csv
+NISO101 Data Protocol Specification (2).pdf
+.gitignore
