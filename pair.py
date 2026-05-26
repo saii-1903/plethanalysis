@@ -36,124 +36,128 @@ class BLEManager:
 
     @property
     def connected(self) -> bool:
-        return self._connected and self._client is not None and self._client.is_connected
+        return (
+            self._connected
+            and self._client is not None
+            and self._client.is_connected
+        )
 
     def on_data(self, callback: DataCallback) -> None:
         self._data_callback = callback
 
     async def scan(self, timeout: Optional[int] = None) -> BLEDevice:
+        """
+        Find the target device by MAC address (from SETTINGS).
+        Raises DiscoveryTimeout if not found within the timeout.
+        """
         addr = SETTINGS.device_address.strip().upper()
-        if addr:
-            logger.info("Scanning for address '%s' ...", addr)
-            device = await BleakScanner.find_device_by_address(
-                addr, timeout=timeout or SETTINGS.scan_timeout
+        t = timeout or SETTINGS.scan_timeout
+        logger.info("Scanning for device %s (timeout=%ds) …", addr, t)
+
+        device = await BleakScanner.find_device_by_address(addr, timeout=t)
+        if device is None:
+            raise DiscoveryTimeout(
+                f"Device {addr!r} not seen within {t}s"
             )
-            if device is None:
-                raise DiscoveryTimeout(
-                    f"Device at '{addr}' not found within {timeout or SETTINGS.scan_timeout}s"
-                )
-        else:
-            logger.info("Scanning for device '%s' ...", SETTINGS.device_name)
-            device = await BleakScanner.find_device_by_name(
-                SETTINGS.device_name, timeout=timeout or SETTINGS.scan_timeout
-            )
-            if device is None:
-                raise DiscoveryTimeout(
-                    f"Device '{SETTINGS.device_name}' not found within {timeout or SETTINGS.scan_timeout}s"
-                )
+
         self._device = device
-        logger.info("Found device: %s [%s]", device.name, device.address)
+        logger.info("Found: %s [%s]", device.name, device.address)
         return device
 
     async def connect(self, timeout: Optional[int] = None) -> None:
+        """
+        Connect to the previously scanned device.
+        Works with bleak 0.x and 1.x — no address_type kwarg.
+        """
         if self._device is None:
             raise RuntimeError("Call scan() before connect()")
-        if self.connected:
-            logger.warning("Already connected")
-            return
 
-        addr = self._device.address
-        timeout = timeout or SETTINGS.connect_timeout
+        # Tear down any stale client before trying again
+        await self._safe_disconnect()
 
-        # Try both address types — Windows sometimes requires "random"
-        for addr_type in (None, "public", "random"):
-            if addr_type is None and self._already_tried("public", "random"):
-                continue
-            logger.info(
-                "Connecting to %s (addr_type=%s) ...", addr, addr_type or "auto"
-            )
-            try:
-                if addr_type:
-                    self._client = BleakClient(
-                        addr, timeout=timeout, address_type=addr_type
-                    )
-                else:
-                    self._client = BleakClient(self._device, timeout=timeout)
-                await self._client.connect()
-                self._connected = True
-                logger.info("Connected to %s", addr)
-                
-                # Log discovered services & characteristics for diagnostics
-                logger.info("Discovering services and characteristics:")
-                for service in self._client.services:
-                    logger.info("Service: %s", service.uuid)
-                    for char in service.characteristics:
-                        logger.info("  -> Characteristic: %s (properties: %s)", char.uuid, char.properties)
-                
-                # Allow the connection and Windows BLE stack to fully stabilize
-                await asyncio.sleep(1.0)
-                return
-            except (BleakError, TimeoutError, asyncio.TimeoutError) as exc:
-                self._connected = False
-                self._client = None
-                logger.warning("  attempt with %s failed: %s", addr_type or "auto", exc)
+        t = timeout or SETTINGS.connect_timeout
+        logger.info("Connecting to %s (timeout=%ds) …", self._device.address, t)
 
-        raise ConnectionFailed(
-            f"Could not connect to {addr} after retries"
-        )
+        try:
+            self._client = BleakClient(self._device, timeout=t)
+            await self._client.connect()
+        except (BleakError, TimeoutError, asyncio.TimeoutError, OSError) as exc:
+            self._client = None
+            raise ConnectionFailed(
+                f"Could not connect to {self._device.address}: {exc}"
+            ) from exc
+
+        self._connected = True
+        logger.info("Connected to %s", self._device.address)
+
+        # Log services for diagnostics
+        for svc in self._client.services:
+            logger.debug("  Service %s", svc.uuid)
+            for ch in svc.characteristics:
+                logger.debug("    Char %s  props=%s", ch.uuid, ch.properties)
+
+        # Let the Windows BLE stack settle
+        await asyncio.sleep(0.8)
 
     async def disconnect(self) -> None:
-        if self._client and self._client.is_connected:
-            await self._client.disconnect()
-        self._connected = False
+        await self._safe_disconnect()
         logger.info("Disconnected")
 
     async def start_stream(self) -> None:
         if not self.connected:
-            raise RuntimeError("Not connected")
-        logger.info("Subscribing to notifications on %s", SETTINGS.send_char_uuid)
-        await self._client.start_notify(SETTINGS.send_char_uuid, self._handle_notification)
-        logger.info("Stream started – listening for data")
+            raise RuntimeError("Not connected — call connect() first")
+        logger.info("Subscribing to %s", SETTINGS.send_char_uuid)
+        await self._client.start_notify(
+            SETTINGS.send_char_uuid, self._handle_notification
+        )
+        logger.info("Stream started — listening for data")
 
     async def stop_stream(self) -> None:
         if self._client and self._client.is_connected:
-            await self._client.stop_notify(SETTINGS.send_char_uuid)
+            try:
+                await self._client.stop_notify(SETTINGS.send_char_uuid)
+            except Exception:
+                pass
         logger.info("Stream stopped")
 
     async def send_command(self, cmd: bytes) -> None:
         if not self.connected:
             raise RuntimeError("Not connected")
-        logger.info("Sending command: %s", cmd.hex())
+        logger.info("Sending command: 0x%s", cmd.hex().upper())
         try:
-            await self._client.write_gatt_char(SETTINGS.recv_char_uuid, cmd, response=True)
-        except Exception as e:
-            logger.warning("Write with response failed, retrying without response: %s", e)
+            await self._client.write_gatt_char(
+                SETTINGS.recv_char_uuid, cmd, response=True
+            )
+            logger.info("Command sent (with-response)")
+        except Exception as e1:
+            logger.warning("write with-response failed (%s) — retrying without", e1)
             try:
-                await self._client.write_gatt_char(SETTINGS.recv_char_uuid, cmd, response=False)
+                await self._client.write_gatt_char(
+                    SETTINGS.recv_char_uuid, cmd, response=False
+                )
+                logger.info("Command sent (without-response)")
             except Exception as e2:
-                logger.error("All write attempts failed: %s", e2)
-                raise e2
+                logger.error("Command write failed entirely: %s", e2)
+                raise
 
     # ------------------------------------------------------------------
-    # Internal
+    # Internal helpers
     # ------------------------------------------------------------------
 
     def _handle_notification(self, _sender: int, data: bytes) -> None:
         if self._data_callback:
             self._data_callback(data)
 
-    def _already_tried(self, *types: str) -> bool:
-        return False  # simple guard — always try the explicit types too
+    async def _safe_disconnect(self) -> None:
+        """Silently tear down any existing client."""
+        if self._client:
+            try:
+                if self._client.is_connected:
+                    await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+        self._connected = False
 
     async def __aenter__(self) -> BLEManager:
         return self
